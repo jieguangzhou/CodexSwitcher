@@ -1,0 +1,6 @@
+# Build artifacts
+CodexSwitcher
+CodexSwitcher.app/
+CodexSwitcher.zip
+.DS_Store
+release.sh
