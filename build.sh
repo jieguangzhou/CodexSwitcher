@@ -9,8 +9,8 @@ swiftc CodexSwitcher.swift -o CodexSwitcher \
     -O
 
 # Update app bundle
-APP="CodexSwitcher.app/Contents/MacOS"
-mkdir -p "$APP"
-cp CodexSwitcher "$APP/CodexSwitcher"
+mkdir -p CodexSwitcher.app/Contents/MacOS
+cp CodexSwitcher CodexSwitcher.app/Contents/MacOS/CodexSwitcher
+cp Info.plist CodexSwitcher.app/Contents/Info.plist
 
 echo "Done. Run with: open CodexSwitcher.app"
