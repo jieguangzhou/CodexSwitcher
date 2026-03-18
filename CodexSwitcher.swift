@@ -1,5 +1,7 @@
 import AppKit
 import Foundation
+import UserNotifications
+import ServiceManagement
 
 // MARK: - Data Models
 
@@ -9,16 +11,48 @@ struct CodexAccount {
     let plan: String
     let authMode: String
     let accountId: String
+    let accessToken: String
     let subscriptionStart: String?
     let subscriptionUntil: String?
     let daysRemaining: Int?
     let tokenExpiry: Date?
+
+    var isTokenExpired: Bool {
+        guard let exp = tokenExpiry else { return false }
+        return exp < Date()
+    }
+
+    var planColor: NSColor {
+        switch plan {
+        case "team": return NSColor(red: 0.2, green: 0.5, blue: 1.0, alpha: 1.0)
+        case "pro": return NSColor(red: 0.6, green: 0.35, blue: 0.9, alpha: 1.0)
+        case "plus": return NSColor(red: 0.2, green: 0.75, blue: 0.5, alpha: 1.0)
+        default: return .secondaryLabelColor
+        }
+    }
+
+    var planLabel: String { plan.uppercased() }
 }
 
 struct RateLimitWindow {
     let usedPercent: Int
-    let windowDurationMins: Int
     let resetsAt: Date?
+
+    var remaining: Int { 100 - min(max(usedPercent, 0), 100) }
+
+    var barColor: NSColor {
+        if remaining <= 10 { return NSColor(red: 0.95, green: 0.3, blue: 0.3, alpha: 1.0) }
+        if remaining <= 25 { return NSColor(red: 0.95, green: 0.6, blue: 0.2, alpha: 1.0) }
+        if remaining <= 50 { return NSColor(red: 0.9, green: 0.8, blue: 0.2, alpha: 1.0) }
+        if remaining <= 75 { return NSColor(red: 0.3, green: 0.78, blue: 0.5, alpha: 1.0) }
+        return NSColor(red: 0.25, green: 0.72, blue: 0.45, alpha: 1.0)
+    }
+
+    var textColor: NSColor {
+        if remaining <= 10 { return NSColor(red: 0.9, green: 0.25, blue: 0.25, alpha: 1.0) }
+        if remaining <= 25 { return NSColor(red: 0.85, green: 0.5, blue: 0.15, alpha: 1.0) }
+        return NSColor.secondaryLabelColor
+    }
 }
 
 struct CreditsSnapshot {
@@ -34,6 +68,51 @@ struct RateLimitInfo {
     let planType: String?
 }
 
+enum FetchState {
+    case idle
+    case loading
+    case success(RateLimitInfo)
+    case failed(String)
+}
+
+// MARK: - Config
+
+struct AppConfig {
+    var refreshIntervalMinutes: Int = 30
+    var minRefreshIntervalSeconds: Int = 30
+    var alert5hThreshold: Int = 30    // alert when 5h remaining < this %
+    var alertWeekThreshold: Int = 10  // alert when week remaining < this %
+
+    private static let configPath: String = {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return "\(home)/.codex/switcher.json"
+    }()
+
+    static func load() -> AppConfig {
+        var config = AppConfig()
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: configPath)),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return config }
+        if let v = json["refresh_interval_minutes"] as? Int, v > 0 { config.refreshIntervalMinutes = v }
+        if let v = json["min_refresh_interval_seconds"] as? Int, v > 0 { config.minRefreshIntervalSeconds = v }
+        if let v = json["alert_5h_threshold"] as? Int { config.alert5hThreshold = v }
+        if let v = json["alert_week_threshold"] as? Int { config.alertWeekThreshold = v }
+        return config
+    }
+
+    func save() {
+        let json: [String: Any] = [
+            "refresh_interval_minutes": refreshIntervalMinutes,
+            "min_refresh_interval_seconds": minRefreshIntervalSeconds,
+            "alert_5h_threshold": alert5hThreshold,
+            "alert_week_threshold": alertWeekThreshold
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: json, options: .prettyPrinted) {
+            try? data.write(to: URL(fileURLWithPath: AppConfig.configPath))
+        }
+    }
+}
+
 // MARK: - Auth Manager
 
 class CodexAuthManager {
@@ -42,7 +121,7 @@ class CodexAuthManager {
     private let codexDir: String
     let authFile: String
     private let currentFile: String
-    private let accountsDir: String
+    let accountsDir: String
 
     init() {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -65,28 +144,64 @@ class CodexAuthManager {
             .sorted()
             .compactMap { file -> CodexAccount? in
                 let alias = String(file.dropLast(5))
-                let path = "\(accountsDir)/\(file)"
-                return parseAccountFile(path, alias: alias)
+                return parseAccountFile("\(accountsDir)/\(file)", alias: alias)
             }
     }
 
     func switchTo(alias: String) -> Bool {
+        let fm = FileManager.default
         let current = currentAlias()
         let targetFile = "\(accountsDir)/\(alias).json"
-        guard FileManager.default.fileExists(atPath: targetFile) else { return false }
-        if !current.isEmpty && current != "?" && FileManager.default.fileExists(atPath: authFile) {
+        guard fm.fileExists(atPath: targetFile) else { return false }
+
+        if !current.isEmpty && current != "?" && fm.fileExists(atPath: authFile) {
             let currentAccountFile = "\(accountsDir)/\(current).json"
-            try? FileManager.default.removeItem(atPath: currentAccountFile)
-            try? FileManager.default.copyItem(atPath: authFile, toPath: currentAccountFile)
+            let tmpFile = currentAccountFile + ".tmp"
+            do {
+                if fm.fileExists(atPath: tmpFile) { try fm.removeItem(atPath: tmpFile) }
+                try fm.copyItem(atPath: authFile, toPath: tmpFile)
+                if fm.fileExists(atPath: currentAccountFile) { try fm.removeItem(atPath: currentAccountFile) }
+                try fm.moveItem(atPath: tmpFile, toPath: currentAccountFile)
+            } catch { try? fm.removeItem(atPath: tmpFile) }
         }
+
         do {
-            try FileManager.default.removeItem(atPath: authFile)
-            try FileManager.default.copyItem(atPath: targetFile, toPath: authFile)
+            if fm.fileExists(atPath: authFile) { try fm.removeItem(atPath: authFile) }
+            try fm.copyItem(atPath: targetFile, toPath: authFile)
             try alias.write(toFile: currentFile, atomically: true, encoding: .utf8)
             return true
-        } catch {
-            return false
+        } catch { return false }
+    }
+
+    func syncAuthToAccounts() {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: authFile) else { return }
+        if !fm.isReadableFile(atPath: accountsDir) {
+            try? fm.createDirectory(atPath: accountsDir, withIntermediateDirectories: true)
         }
+        guard let authAccount = parseAccountFile(authFile, alias: "_tmp"), authAccount.email != "?" else { return }
+        let accounts = listAccounts()
+        if let existing = accounts.first(where: { $0.email == authAccount.email }) {
+            let accountFile = "\(accountsDir)/\(existing.alias).json"
+            try? fm.removeItem(atPath: accountFile)
+            try? fm.copyItem(atPath: authFile, toPath: accountFile)
+            try? existing.alias.write(toFile: currentFile, atomically: true, encoding: .utf8)
+            return
+        }
+        var alias = authAccount.email.components(separatedBy: "@").first ?? "account"
+        let existingAliases = Set(accounts.map { $0.alias })
+        if existingAliases.contains(alias) {
+            var i = 1
+            while existingAliases.contains("\(alias)\(i)") { i += 1 }
+            alias = "\(alias)\(i)"
+        }
+        try? fm.copyItem(atPath: authFile, toPath: "\(accountsDir)/\(alias).json")
+        try? alias.write(toFile: currentFile, atomically: true, encoding: .utf8)
+    }
+
+    func deleteAccount(alias: String) -> Bool {
+        let accountFile = "\(accountsDir)/\(alias).json"
+        return (try? FileManager.default.removeItem(atPath: accountFile)) != nil
     }
 
     func parseAccountFile(_ path: String, alias: String) -> CodexAccount? {
@@ -96,9 +211,9 @@ class CodexAuthManager {
         let authMode = json["auth_mode"] as? String ?? "chatgpt"
         let tokens = json["tokens"] as? [String: Any] ?? [:]
         let accountId = tokens["account_id"] as? String ?? "?"
+        let accessToken = tokens["access_token"] as? String ?? ""
         var email = "?"; var plan = "?"
-        var subStart: String?; var subUntil: String?
-        var daysRemaining: Int?; var tokenExpiry: Date?
+        var subStart: String?; var subUntil: String?; var daysRemaining: Int?; var tokenExpiry: Date?
         if let idToken = tokens["id_token"] as? String, let payload = decodeJWTPayload(idToken) {
             email = payload["email"] as? String ?? "?"
             if let exp = payload["exp"] as? Double { tokenExpiry = Date(timeIntervalSince1970: exp) }
@@ -119,7 +234,8 @@ class CodexAuthManager {
             if let exp = p["exp"] as? Double { tokenExpiry = Date(timeIntervalSince1970: exp) }
         }
         return CodexAccount(alias: alias, email: email, plan: plan, authMode: authMode,
-            accountId: accountId, subscriptionStart: subStart, subscriptionUntil: subUntil,
+            accountId: accountId, accessToken: accessToken,
+            subscriptionStart: subStart, subscriptionUntil: subUntil,
             daysRemaining: daysRemaining, tokenExpiry: tokenExpiry)
     }
 
@@ -135,238 +251,285 @@ class CodexAuthManager {
     }
 }
 
-// MARK: - App-Server Rate Limit Client
+// MARK: - Rate Limit Client
 
 class RateLimitClient {
-    private var serverProcess: Process?
-    private let port: Int
-    private let codexPath = "/Applications/Codex.app/Contents/Resources/codex"
-    var rateLimitInfo: RateLimitInfo?
+    private let apiURL = "https://chatgpt.com/backend-api/wham/usage"
+    var usageByAlias: [String: FetchState] = [:]
+    var lastFetchTime: Date?
     var onUpdate: (() -> Void)?
 
-    init() {
-        port = Int.random(in: 19000...19999)
-    }
-
-    func start() {
-        DispatchQueue.global(qos: .background).async { [weak self] in
-            self?.launchAndQuery()
-        }
-    }
-
-    func refresh() {
-        // Kill existing server and re-query
-        serverProcess?.terminate()
-        serverProcess = nil
-        rateLimitInfo = nil
-        start()
-    }
-
-    private func launchAndQuery() {
-        guard FileManager.default.fileExists(atPath: codexPath) else { return }
-
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: codexPath)
-        proc.arguments = ["app-server", "--listen", "ws://127.0.0.1:\(port)"]
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
-        serverProcess = proc
-
-        do { try proc.run() } catch { return }
-
-        // Wait for server to be ready
-        Thread.sleep(forTimeInterval: 3)
-        guard proc.isRunning else { return }
-
-        // Connect via raw socket websocket
-        queryRateLimits()
-
-        // Terminate server after query
-        proc.terminate()
-        serverProcess = nil
-    }
-
-    private func queryRateLimits() {
-        guard let sock = wsConnect(host: "127.0.0.1", port: port) else { return }
-        defer { close(sock) }
-
-        // Initialize
-        let initMsg = """
-        {"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"codex-switcher","title":null,"version":"1.0"},"capabilities":null}}
-        """
-        wsSend(sock, message: initMsg)
-        _ = wsRecv(sock, timeout: 5)
-
-        // Rate limits
-        wsSend(sock, message: """
-        {"jsonrpc":"2.0","method":"account/rateLimits/read","id":2}
-        """)
-
-        for _ in 0..<10 {
-            guard let resp = wsRecv(sock, timeout: 10) else { break }
-            guard let data = try? JSONSerialization.jsonObject(with: Data(resp.utf8)) as? [String: Any] else { continue }
-            if let id = data["id"] as? Int, id == 2 {
-                if let result = data["result"] as? [String: Any],
-                   let rl = result["rateLimits"] as? [String: Any] {
-                    self.rateLimitInfo = parseRateLimitSnapshot(rl)
-                    DispatchQueue.main.async { self.onUpdate?() }
-                }
-                break
+    func fetchAll(_ accounts: [CodexAccount]) {
+        lastFetchTime = Date()
+        for acct in accounts {
+            if acct.accessToken.isEmpty || acct.accountId == "?" {
+                usageByAlias[acct.alias] = .failed("No credentials")
+                continue
             }
+            // Only show loading if no previous data
+            if usageByAlias[acct.alias] == nil { usageByAlias[acct.alias] = .loading }
+            fetchForAccount(acct)
         }
+        DispatchQueue.main.async { self.onUpdate?() }
     }
 
-    private func parseRateLimitSnapshot(_ json: [String: Any]) -> RateLimitInfo {
-        let primary = parseWindow(json["primary"])
-        let secondary = parseWindow(json["secondary"])
+    func refreshIfNeeded(_ accounts: [CodexAccount], minInterval: TimeInterval) {
+        if let last = lastFetchTime, Date().timeIntervalSince(last) < minInterval { return }
+        fetchAll(accounts)
+    }
+
+    private func fetchForAccount(_ acct: CodexAccount) {
+        guard let url = URL(string: apiURL) else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(acct.accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(acct.accountId, forHTTPHeaderField: "ChatGPT-Account-Id")
+        request.setValue("codex-switcher/1.0", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 15
+        let alias = acct.alias
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self else { return }
+            if error != nil { self.setState(alias, .failed("Network error")); return }
+            guard let http = response as? HTTPURLResponse, let data = data else {
+                self.setState(alias, .failed("No response")); return
+            }
+            if http.statusCode == 401 { self.setState(alias, .failed("Token expired")); return }
+            if http.statusCode != 200 { self.setState(alias, .failed("HTTP \(http.statusCode)")); return }
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                self.setState(alias, .failed("Parse error")); return
+            }
+            self.setState(alias, .success(self.parseResponse(json)))
+        }.resume()
+    }
+
+    private func setState(_ alias: String, _ state: FetchState) {
+        DispatchQueue.main.async { self.usageByAlias[alias] = state; self.onUpdate?() }
+    }
+
+    private func parseResponse(_ json: [String: Any]) -> RateLimitInfo {
+        var primary: RateLimitWindow? = nil; var secondary: RateLimitWindow? = nil
+        if let rl = json["rate_limit"] as? [String: Any] {
+            primary = parseWindow(rl["primary_window"])
+            secondary = parseWindow(rl["secondary_window"])
+        }
         var credits: CreditsSnapshot? = nil
         if let c = json["credits"] as? [String: Any] {
-            credits = CreditsSnapshot(
-                hasCredits: c["hasCredits"] as? Bool ?? false,
-                unlimited: c["unlimited"] as? Bool ?? false,
-                balance: c["balance"] as? String
-            )
+            credits = CreditsSnapshot(hasCredits: c["has_credits"] as? Bool ?? false,
+                unlimited: c["unlimited"] as? Bool ?? false, balance: c["balance"] as? String)
         }
-        return RateLimitInfo(primary: primary, secondary: secondary, credits: credits, planType: json["planType"] as? String)
+        return RateLimitInfo(primary: primary, secondary: secondary, credits: credits, planType: json["plan_type"] as? String)
     }
 
     private func parseWindow(_ obj: Any?) -> RateLimitWindow? {
         guard let w = obj as? [String: Any] else { return nil }
-        let used = w["usedPercent"] as? Int ?? 0
-        let dur = w["windowDurationMins"] as? Int ?? 0
-        var resetsAt: Date? = nil
-        if let ts = w["resetsAt"] as? Double { resetsAt = Date(timeIntervalSince1970: ts) }
-        return RateLimitWindow(usedPercent: used, windowDurationMins: dur, resetsAt: resetsAt)
-    }
-
-    // MARK: - Raw WebSocket
-
-    private func wsConnect(host: String, port: Int) -> Int32? {
-        let sock = socket(AF_INET, SOCK_STREAM, 0)
-        guard sock >= 0 else { return nil }
-
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = UInt16(port).bigEndian
-        inet_pton(AF_INET, host, &addr.sin_addr)
-
-        let result = withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
-                connect(sock, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard result == 0 else { close(sock); return nil }
-
-        // WebSocket handshake
-        var keyBytes = [UInt8](repeating: 0, count: 16)
-        _ = SecRandomCopyBytes(kSecRandomDefault, 16, &keyBytes)
-        let key = Data(keyBytes).base64EncodedString()
-
-        let handshake = "GET / HTTP/1.1\r\nHost: \(host):\(port)\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: \(key)\r\nSec-WebSocket-Version: 13\r\n\r\n"
-        _ = handshake.withCString { send(sock, $0, strlen($0), 0) }
-
-        var buf = [UInt8](repeating: 0, count: 4096)
-        let n = recv(sock, &buf, buf.count, 0)
-        guard n > 0 else { close(sock); return nil }
-        let resp = String(bytes: buf[0..<n], encoding: .utf8) ?? ""
-        guard resp.contains("101") else { close(sock); return nil }
-
-        return sock
-    }
-
-    private func wsSend(_ sock: Int32, message: String) {
-        let data = Array(message.utf8)
-        var frame = [UInt8]()
-        frame.append(0x81)
-
-        var maskKey = [UInt8](repeating: 0, count: 4)
-        _ = SecRandomCopyBytes(kSecRandomDefault, 4, &maskKey)
-
-        if data.count < 126 {
-            frame.append(UInt8(0x80 | data.count))
-        } else if data.count < 65536 {
-            frame.append(0x80 | 126)
-            frame.append(UInt8((data.count >> 8) & 0xFF))
-            frame.append(UInt8(data.count & 0xFF))
-        } else {
-            frame.append(0x80 | 127)
-            for i in stride(from: 56, through: 0, by: -8) {
-                frame.append(UInt8((data.count >> i) & 0xFF))
-            }
-        }
-        frame.append(contentsOf: maskKey)
-        for (i, byte) in data.enumerated() {
-            frame.append(byte ^ maskKey[i % 4])
-        }
-        frame.withUnsafeBufferPointer { buf in
-            _ = send(sock, buf.baseAddress!, buf.count, 0)
-        }
-    }
-
-    private func wsRecv(_ sock: Int32, timeout: Int = 10) -> String? {
-        var tv = timeval(tv_sec: timeout, tv_usec: 0)
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-
-        var header = [UInt8](repeating: 0, count: 2)
-        guard recv(sock, &header, 2, MSG_WAITALL) == 2 else { return nil }
-
-        var length = Int(header[1] & 0x7F)
-        if length == 126 {
-            var ext = [UInt8](repeating: 0, count: 2)
-            guard recv(sock, &ext, 2, MSG_WAITALL) == 2 else { return nil }
-            length = Int(ext[0]) << 8 | Int(ext[1])
-        } else if length == 127 {
-            var ext = [UInt8](repeating: 0, count: 8)
-            guard recv(sock, &ext, 8, MSG_WAITALL) == 8 else { return nil }
-            length = 0
-            for b in ext { length = length << 8 | Int(b) }
-        }
-
-        var payload = [UInt8](repeating: 0, count: length)
-        var received = 0
-        while received < length {
-            let n = recv(sock, &payload[received], length - received, 0)
-            guard n > 0 else { return nil }
-            received += n
-        }
-        return String(bytes: payload, encoding: .utf8)
-    }
-
-    deinit {
-        serverProcess?.terminate()
+        return RateLimitWindow(usedPercent: w["used_percent"] as? Int ?? 0,
+            resetsAt: (w["reset_at"] as? Double).map { Date(timeIntervalSince1970: $0) })
     }
 }
 
 // MARK: - Menu Bar App
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let authManager = CodexAuthManager.shared
     private var fileMonitor: DispatchSourceFileSystemObject?
     private let rateLimitClient = RateLimitClient()
     private var refreshTimer: Timer?
+    private var config = AppConfig.load()
+    private var previousAlertState: (p5h: Bool, pWk: Bool) = (false, false)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         rateLimitClient.onUpdate = { [weak self] in self?.updateMenu() }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        authManager.syncAuthToAccounts()
         updateMenu()
         watchAuthFile()
-        rateLimitClient.start()
+        rateLimitClient.fetchAll(authManager.listAccounts())
+        scheduleTimer()
+    }
 
-        // Auto-refresh rate limits every 3 minutes
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 180, repeats: true) { [weak self] _ in
-            self?.rateLimitClient.refresh()
+    private func scheduleTimer() {
+        refreshTimer?.invalidate()
+        let interval = TimeInterval(config.refreshIntervalMinutes * 60)
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            self.rateLimitClient.fetchAll(self.authManager.listAccounts())
         }
     }
 
-    private func formatDate(_ isoString: String?) -> String? {
-        guard let str = isoString else { return nil }
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        guard let date = f.date(from: str) ?? ISO8601DateFormatter().date(from: str) else { return nil }
-        let df = DateFormatter()
-        df.dateFormat = "yyyy-MM-dd"
-        return df.string(from: date)
+    // Refresh on menu open (smart: skip if recent)
+    func menuWillOpen(_ menu: NSMenu) {
+        let minInterval = TimeInterval(config.minRefreshIntervalSeconds)
+        rateLimitClient.refreshIfNeeded(authManager.listAccounts(), minInterval: minInterval)
+    }
+
+    // MARK: - Drawing Helpers
+
+    /// AI character icons for status bar
+    private func makeAIIcon(state: Int) -> NSImage {
+        // state: 0 = standing (normal), 1 = tired (5h alert), 2 = lying (week alert)
+        let s: CGFloat = 18
+        let img = NSImage(size: NSSize(width: s, height: s))
+        img.lockFocus()
+        NSColor.black.setStroke()
+        NSColor.black.setFill()
+
+        switch state {
+        case 2: drawLyingAI(s: s)
+        case 1: drawTiredAI(s: s)
+        default: drawStandingAI(s: s)
+        }
+
+        img.unlockFocus()
+        img.isTemplate = true
+        return img
+    }
+
+    private func drawStandingAI(s: CGFloat) {
+        let cx = s * 0.5
+        // Antenna
+        let antennaPath = NSBezierPath()
+        antennaPath.move(to: NSPoint(x: cx, y: s * 0.78))
+        antennaPath.line(to: NSPoint(x: cx, y: s * 0.88))
+        antennaPath.lineWidth = 1.2; antennaPath.lineCapStyle = .round; antennaPath.stroke()
+        NSBezierPath(ovalIn: NSRect(x: cx - 1.5, y: s * 0.88, width: 3, height: 3)).fill()
+
+        // Head
+        let headR: CGFloat = s * 0.15
+        let headY = s * 0.65
+        NSBezierPath(ovalIn: NSRect(x: cx - headR, y: headY, width: headR * 2, height: headR * 2)).stroke()
+        // Eyes
+        let eyeR: CGFloat = 1.2
+        NSBezierPath(ovalIn: NSRect(x: cx - headR * 0.5 - eyeR, y: headY + headR * 0.7, width: eyeR * 2, height: eyeR * 2)).fill()
+        NSBezierPath(ovalIn: NSRect(x: cx + headR * 0.5 - eyeR, y: headY + headR * 0.7, width: eyeR * 2, height: eyeR * 2)).fill()
+
+        // Body
+        let bodyPath = NSBezierPath()
+        bodyPath.move(to: NSPoint(x: cx, y: headY))
+        bodyPath.line(to: NSPoint(x: cx, y: s * 0.28))
+        bodyPath.lineWidth = 1.5; bodyPath.lineCapStyle = .round; bodyPath.stroke()
+
+        // Arms (up, like waving)
+        let armPath = NSBezierPath()
+        armPath.move(to: NSPoint(x: cx, y: s * 0.52))
+        armPath.line(to: NSPoint(x: cx - s * 0.2, y: s * 0.6))
+        armPath.move(to: NSPoint(x: cx, y: s * 0.52))
+        armPath.line(to: NSPoint(x: cx + s * 0.2, y: s * 0.6))
+        armPath.lineWidth = 1.3; armPath.lineCapStyle = .round; armPath.stroke()
+
+        // Legs
+        let legPath = NSBezierPath()
+        legPath.move(to: NSPoint(x: cx, y: s * 0.28))
+        legPath.line(to: NSPoint(x: cx - s * 0.14, y: s * 0.08))
+        legPath.move(to: NSPoint(x: cx, y: s * 0.28))
+        legPath.line(to: NSPoint(x: cx + s * 0.14, y: s * 0.08))
+        legPath.lineWidth = 1.3; legPath.lineCapStyle = .round; legPath.stroke()
+    }
+
+    private func drawTiredAI(s: CGFloat) {
+        let cx = s * 0.5
+        // Antenna (drooping)
+        let antennaPath = NSBezierPath()
+        antennaPath.move(to: NSPoint(x: cx, y: s * 0.75))
+        antennaPath.line(to: NSPoint(x: cx - s * 0.05, y: s * 0.83))
+        antennaPath.lineWidth = 1.2; antennaPath.lineCapStyle = .round; antennaPath.stroke()
+        NSBezierPath(ovalIn: NSRect(x: cx - s * 0.05 - 1.5, y: s * 0.82, width: 3, height: 3)).fill()
+
+        // Head (slightly drooping)
+        let headR: CGFloat = s * 0.15
+        let headY = s * 0.6
+        NSBezierPath(ovalIn: NSRect(x: cx - headR - s * 0.02, y: headY, width: headR * 2, height: headR * 2)).stroke()
+        // Tired eyes (lines instead of dots)
+        let eyePath = NSBezierPath()
+        eyePath.move(to: NSPoint(x: cx - headR * 0.7, y: headY + headR * 0.85))
+        eyePath.line(to: NSPoint(x: cx - headR * 0.1, y: headY + headR * 0.75))
+        eyePath.move(to: NSPoint(x: cx + headR * 0.1, y: headY + headR * 0.85))
+        eyePath.line(to: NSPoint(x: cx + headR * 0.7, y: headY + headR * 0.75))
+        eyePath.lineWidth = 1.0; eyePath.lineCapStyle = .round; eyePath.stroke()
+
+        // Body (slouching, slight curve)
+        let bodyPath = NSBezierPath()
+        bodyPath.move(to: NSPoint(x: cx - s * 0.02, y: headY))
+        bodyPath.curve(to: NSPoint(x: cx, y: s * 0.24),
+                       controlPoint1: NSPoint(x: cx + s * 0.05, y: s * 0.5),
+                       controlPoint2: NSPoint(x: cx - s * 0.05, y: s * 0.35))
+        bodyPath.lineWidth = 1.5; bodyPath.lineCapStyle = .round; bodyPath.stroke()
+
+        // Arms (hanging down)
+        let armPath = NSBezierPath()
+        armPath.move(to: NSPoint(x: cx, y: s * 0.48))
+        armPath.line(to: NSPoint(x: cx - s * 0.18, y: s * 0.32))
+        armPath.move(to: NSPoint(x: cx, y: s * 0.48))
+        armPath.line(to: NSPoint(x: cx + s * 0.18, y: s * 0.32))
+        armPath.lineWidth = 1.3; armPath.lineCapStyle = .round; armPath.stroke()
+
+        // Legs (wobbly)
+        let legPath = NSBezierPath()
+        legPath.move(to: NSPoint(x: cx, y: s * 0.24))
+        legPath.line(to: NSPoint(x: cx - s * 0.12, y: s * 0.06))
+        legPath.move(to: NSPoint(x: cx, y: s * 0.24))
+        legPath.line(to: NSPoint(x: cx + s * 0.12, y: s * 0.06))
+        legPath.lineWidth = 1.3; legPath.lineCapStyle = .round; legPath.stroke()
+
+        // Sweat drop
+        NSBezierPath(ovalIn: NSRect(x: cx + headR + 1, y: headY + headR * 0.5, width: 2, height: 3)).fill()
+    }
+
+    private func drawLyingAI(s: CGFloat) {
+        let cy = s * 0.38
+        // Ground line
+        let groundPath = NSBezierPath()
+        groundPath.move(to: NSPoint(x: s * 0.05, y: s * 0.15))
+        groundPath.line(to: NSPoint(x: s * 0.95, y: s * 0.15))
+        groundPath.lineWidth = 0.8; groundPath.lineCapStyle = .round; groundPath.stroke()
+
+        // Lying body (horizontal)
+        // Head (right side)
+        let headR: CGFloat = s * 0.13
+        let headX = s * 0.75
+        NSBezierPath(ovalIn: NSRect(x: headX, y: cy - headR + s * 0.02, width: headR * 2, height: headR * 2)).stroke()
+        // X eyes (knocked out)
+        let exPath = NSBezierPath()
+        let eyeCx1 = headX + headR * 0.6; let eyeCx2 = headX + headR * 1.4
+        let eyeCy = cy + s * 0.05
+        let ex: CGFloat = 1.5
+        exPath.move(to: NSPoint(x: eyeCx1 - ex, y: eyeCy - ex)); exPath.line(to: NSPoint(x: eyeCx1 + ex, y: eyeCy + ex))
+        exPath.move(to: NSPoint(x: eyeCx1 + ex, y: eyeCy - ex)); exPath.line(to: NSPoint(x: eyeCx1 - ex, y: eyeCy + ex))
+        exPath.move(to: NSPoint(x: eyeCx2 - ex, y: eyeCy - ex)); exPath.line(to: NSPoint(x: eyeCx2 + ex, y: eyeCy + ex))
+        exPath.move(to: NSPoint(x: eyeCx2 + ex, y: eyeCy - ex)); exPath.line(to: NSPoint(x: eyeCx2 - ex, y: eyeCy + ex))
+        exPath.lineWidth = 1.0; exPath.lineCapStyle = .round; exPath.stroke()
+
+        // Body (horizontal line)
+        let bodyPath = NSBezierPath()
+        bodyPath.move(to: NSPoint(x: headX, y: cy))
+        bodyPath.line(to: NSPoint(x: s * 0.28, y: cy))
+        bodyPath.lineWidth = 1.5; bodyPath.lineCapStyle = .round; bodyPath.stroke()
+
+        // Legs (slightly bent, to the left)
+        let legPath = NSBezierPath()
+        legPath.move(to: NSPoint(x: s * 0.28, y: cy))
+        legPath.line(to: NSPoint(x: s * 0.15, y: cy + s * 0.1))
+        legPath.move(to: NSPoint(x: s * 0.28, y: cy))
+        legPath.line(to: NSPoint(x: s * 0.12, y: cy - s * 0.08))
+        legPath.lineWidth = 1.3; legPath.lineCapStyle = .round; legPath.stroke()
+
+        // Arms (flopped)
+        let armPath = NSBezierPath()
+        armPath.move(to: NSPoint(x: s * 0.55, y: cy))
+        armPath.line(to: NSPoint(x: s * 0.5, y: cy + s * 0.15))
+        armPath.move(to: NSPoint(x: s * 0.45, y: cy))
+        armPath.line(to: NSPoint(x: s * 0.42, y: cy - s * 0.12))
+        armPath.lineWidth = 1.3; armPath.lineCapStyle = .round; armPath.stroke()
+
+        // Zzz
+        let zFont = NSFont.systemFont(ofSize: 6, weight: .bold)
+        ("z" as NSString).draw(at: NSPoint(x: s * 0.82, y: s * 0.6), withAttributes: [
+            .font: zFont, .foregroundColor: NSColor.black
+        ])
+        ("z" as NSString).draw(at: NSPoint(x: s * 0.72, y: s * 0.7), withAttributes: [
+            .font: NSFont.systemFont(ofSize: 5, weight: .bold), .foregroundColor: NSColor.black
+        ])
     }
 
     private func formatResetTime(_ date: Date?) -> String {
@@ -374,278 +537,349 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let mins = Int(d.timeIntervalSinceNow / 60)
         if mins <= 0 { return "now" }
         if mins < 60 { return "\(mins)m" }
-        let hours = mins / 60
-        let remMins = mins % 60
+        let hours = mins / 60; let remMins = mins % 60
         if hours < 24 { return remMins > 0 ? "\(hours)h\(remMins)m" : "\(hours)h" }
         return "\(hours / 24)d\(hours % 24)h"
     }
 
-    private func usageBar(_ percent: Int, width: Int = 15) -> String {
-        let filled = Int(Double(percent) / 100.0 * Double(width))
-        let empty = width - filled
-        return String(repeating: "\u{2588}", count: filled) + String(repeating: "\u{2591}", count: empty)
+    private func makeProgressBar(remaining: Int, width: CGFloat = 100, height: CGFloat = 8) -> NSImage {
+        let pct = CGFloat(min(max(remaining, 0), 100)) / 100.0
+        let img = NSImage(size: NSSize(width: width, height: height))
+        img.lockFocus()
+
+        let radius: CGFloat = 4
+        let trackColor = NSColor.separatorColor.withAlphaComponent(0.3)
+        let bgRect = NSRect(x: 0, y: 0, width: width, height: height)
+        trackColor.setFill()
+        NSBezierPath(roundedRect: bgRect, xRadius: radius, yRadius: radius).fill()
+
+        let fillWidth = width * pct
+        if fillWidth > 0 {
+            let window = RateLimitWindow(usedPercent: 100 - remaining, resetsAt: nil)
+            let fillRect = NSRect(x: 0, y: 0, width: fillWidth, height: height)
+            window.barColor.setFill()
+            NSBezierPath(roundedRect: fillRect, xRadius: radius, yRadius: radius).fill()
+        }
+
+        img.unlockFocus()
+        return img
     }
+
+    private func barAttachment(remaining: Int) -> NSAttributedString {
+        let img = makeProgressBar(remaining: remaining)
+        let att = NSTextAttachment()
+        att.image = img
+        att.bounds = NSRect(x: 0, y: 2, width: img.size.width, height: img.size.height)
+        return NSAttributedString(attachment: att)
+    }
+
+    private func sendNotification(title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title; content.body = body; content.sound = .default
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+    }
+
+    // MARK: - Build Menu
 
     private func updateMenu() {
         let current = authManager.currentAlias()
         let accounts = authManager.listAccounts()
+        let active = accounts.first(where: { $0.alias == current })
+        let others = accounts.filter { $0.alias != current }
 
-        // Status bar
+        // Status bar - icon only, with red dot alerts
         if let button = statusItem.button {
-            if let img = NSImage(systemSymbolName: "person.2.circle", accessibilityDescription: "Codex Switcher") {
-                let config = NSImage.SymbolConfiguration(pointSize: 16, weight: .medium)
-                button.image = img.withSymbolConfiguration(config)
-                button.imagePosition = .imageOnly
+            var alert5h = false, alertWk = false
+            if let acct = active, case .success(let rl) = rateLimitClient.usageByAlias[acct.alias] {
+                let p5h = rl.primary?.remaining ?? 100
+                let pWk = rl.secondary?.remaining ?? 100
+                alert5h = p5h < config.alert5hThreshold
+                alertWk = pWk < config.alertWeekThreshold
+
+                // Send notification on new alerts (not on every refresh)
+                if alert5h && !previousAlertState.p5h {
+                    sendNotification(title: "\(acct.alias) - 5h Quota Low",
+                        body: "5h remaining: \(p5h)%")
+                }
+                if alertWk && !previousAlertState.pWk {
+                    sendNotification(title: "\(acct.alias) - Weekly Quota Low",
+                        body: "Weekly remaining: \(pWk)%")
+                }
+                previousAlertState = (alert5h, alertWk)
+
+                button.toolTip = "Codex: \(acct.alias) | 5h: \(p5h)% | Week: \(pWk)%"
+            } else {
+                button.toolTip = "Codex: \(active?.alias ?? current)"
             }
-            let currentAccount = accounts.first(where: { $0.alias == current })
-            var tip = "Codex: \(currentAccount?.alias ?? current) (\(currentAccount?.plan ?? "?"))"
-            if let rl = rateLimitClient.rateLimitInfo {
-                let p = rl.primary?.usedPercent ?? 0
-                let s = rl.secondary?.usedPercent ?? 0
-                tip += "\n5h: \(p)% | Week: \(s)%"
-            }
-            button.toolTip = tip
+            let iconState = alertWk ? 2 : (alert5h ? 1 : 0)
+            button.image = makeAIIcon(state: iconState)
+            button.title = ""
+            button.imagePosition = .imageOnly
         }
 
         let menu = NSMenu()
+        menu.delegate = self
+        menu.minimumWidth = 320
 
-        // === Rate Limits Section ===
-        if let rl = rateLimitClient.rateLimitInfo {
-            let rlHeader = NSMenuItem()
-            rlHeader.attributedTitle = NSAttributedString(string: "USAGE", attributes: [
-                .font: NSFont.systemFont(ofSize: 10, weight: .bold),
-                .foregroundColor: NSColor.tertiaryLabelColor,
-                .kern: 1.5
-            ])
-            rlHeader.isEnabled = false
-            menu.addItem(rlHeader)
-
-            // 5-hour window
-            if let p = rl.primary {
-                let item = NSMenuItem()
-                let title = NSMutableAttributedString()
-                let remaining = 100 - p.usedPercent
-                let color: NSColor = remaining <= 10 ? .systemRed : remaining <= 25 ? .systemOrange : .secondaryLabelColor
-
-                title.append(NSAttributedString(string: "  5h   ", attributes: [
-                    .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .medium),
-                    .foregroundColor: NSColor.labelColor
-                ]))
-                title.append(NSAttributedString(string: usageBar(p.usedPercent), attributes: [
-                    .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .regular),
-                    .foregroundColor: color
-                ]))
-                title.append(NSAttributedString(string: "  \(remaining)% left", attributes: [
-                    .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .medium),
-                    .foregroundColor: color
-                ]))
-                if p.resetsAt != nil {
-                    title.append(NSAttributedString(string: "  \u{21BB}\(formatResetTime(p.resetsAt))", attributes: [
-                        .font: NSFont.systemFont(ofSize: 10),
-                        .foregroundColor: NSColor.tertiaryLabelColor
-                    ]))
-                }
-                item.attributedTitle = title
-                item.isEnabled = false
-                menu.addItem(item)
-            }
-
-            // Weekly window
-            if let s = rl.secondary {
-                let item = NSMenuItem()
-                let title = NSMutableAttributedString()
-                let remaining = 100 - s.usedPercent
-                let color: NSColor = remaining <= 10 ? .systemRed : remaining <= 25 ? .systemOrange : .secondaryLabelColor
-
-                title.append(NSAttributedString(string: "  Week ", attributes: [
-                    .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .medium),
-                    .foregroundColor: NSColor.labelColor
-                ]))
-                title.append(NSAttributedString(string: usageBar(s.usedPercent), attributes: [
-                    .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .regular),
-                    .foregroundColor: color
-                ]))
-                title.append(NSAttributedString(string: "  \(remaining)% left", attributes: [
-                    .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .medium),
-                    .foregroundColor: color
-                ]))
-                if s.resetsAt != nil {
-                    title.append(NSAttributedString(string: "  \u{21BB}\(formatResetTime(s.resetsAt))", attributes: [
-                        .font: NSFont.systemFont(ofSize: 10),
-                        .foregroundColor: NSColor.tertiaryLabelColor
-                    ]))
-                }
-                item.attributedTitle = title
-                item.isEnabled = false
-                menu.addItem(item)
-            }
-
-            // Credits
-            if let credits = rl.credits {
-                let item = NSMenuItem()
-                let title = NSMutableAttributedString()
-                let creditText: String
-                if credits.unlimited {
-                    creditText = "  Credits: Unlimited"
-                } else if let bal = credits.balance, !bal.isEmpty {
-                    creditText = "  Credits: \(bal)"
-                } else if credits.hasCredits {
-                    creditText = "  Credits: Available"
-                } else {
-                    creditText = "  Credits: None"
-                }
-                title.append(NSAttributedString(string: creditText, attributes: [
-                    .font: NSFont.systemFont(ofSize: 11),
-                    .foregroundColor: credits.hasCredits || credits.unlimited ? NSColor.secondaryLabelColor : NSColor.tertiaryLabelColor
-                ]))
-                item.attributedTitle = title
-                item.isEnabled = false
-                menu.addItem(item)
-            }
-
-            menu.addItem(NSMenuItem.separator())
-        } else {
-            // Loading state
-            let loadingItem = NSMenuItem()
-            loadingItem.attributedTitle = NSAttributedString(string: "  Loading usage...", attributes: [
-                .font: NSFont.systemFont(ofSize: 11),
-                .foregroundColor: NSColor.tertiaryLabelColor
-            ])
-            loadingItem.isEnabled = false
-            menu.addItem(loadingItem)
+        // ─── Active Account ───
+        if let acct = active {
+            buildCard(menu, acct, isActive: true)
             menu.addItem(NSMenuItem.separator())
         }
 
-        // === Accounts Section ===
-        let acctHeader = NSMenuItem()
-        acctHeader.attributedTitle = NSAttributedString(string: "ACCOUNTS", attributes: [
-            .font: NSFont.systemFont(ofSize: 10, weight: .bold),
-            .foregroundColor: NSColor.tertiaryLabelColor,
-            .kern: 1.5
-        ])
-        acctHeader.isEnabled = false
-        menu.addItem(acctHeader)
-        menu.addItem(NSMenuItem.separator())
-
-        for account in accounts {
-            let isActive = account.alias == current
-            let item = NSMenuItem()
-            item.representedObject = account.alias
-            let title = NSMutableAttributedString()
-
-            let check = isActive ? "\u{2713} " : "     "
-            title.append(NSAttributedString(string: check, attributes: [
-                .font: NSFont.systemFont(ofSize: 13, weight: .bold),
-                .foregroundColor: isActive ? NSColor.systemGreen : NSColor.clear
-            ]))
-            title.append(NSAttributedString(string: account.alias, attributes: [
-                .font: NSFont.systemFont(ofSize: 13, weight: isActive ? .semibold : .regular)
-            ]))
-            let planColor: NSColor
-            switch account.plan {
-            case "team": planColor = .systemBlue
-            case "pro": planColor = .systemPurple
-            case "plus": planColor = .systemGreen
-            default: planColor = .systemGray
+        // ─── Other Accounts ───
+        if !others.isEmpty {
+            for (i, account) in others.enumerated() {
+                buildCard(menu, account, isActive: false)
+                if i < others.count - 1 { menu.addItem(NSMenuItem.separator()) }
             }
-            title.append(NSAttributedString(string: "  \(account.plan.uppercased())", attributes: [
-                .font: NSFont.systemFont(ofSize: 9, weight: .bold),
-                .foregroundColor: planColor,
-                .baselineOffset: 2
-            ]))
+            menu.addItem(NSMenuItem.separator())
+        }
 
-            title.append(NSAttributedString(string: "\n     \(account.email)", attributes: [
-                .font: NSFont.systemFont(ofSize: 11),
-                .foregroundColor: NSColor.secondaryLabelColor
-            ]))
+        // ─── Actions ───
+        addMenuItem(menu, "Refresh All", #selector(refreshUsage), "r")
 
-            // Subscription info
-            var subLine = ""
-            if let days = account.daysRemaining, let until = formatDate(account.subscriptionUntil) {
-                if days < 0 { subLine = "     \u{26A0} Expired" }
-                else { subLine = "     \u{23F3} \(days)d left \u{2192} \(until)" }
+        if !others.isEmpty {
+            let removeItem = NSMenuItem(title: "Remove Account", action: nil, keyEquivalent: "")
+            let sub = NSMenu()
+            for acct in others {
+                let item = NSMenuItem(title: acct.alias, action: #selector(deleteAccount(_:)), keyEquivalent: "")
+                item.target = self; item.representedObject = acct.alias
+                sub.addItem(item)
             }
-            var tokenWarning = ""
-            if let exp = account.tokenExpiry, exp < Date() { tokenWarning = "  \u{1F534} Token expired" }
-
-            if !subLine.isEmpty || !tokenWarning.isEmpty {
-                let subColor: NSColor
-                if account.daysRemaining != nil && account.daysRemaining! < 0 { subColor = .systemRed }
-                else if account.daysRemaining != nil && account.daysRemaining! <= 7 { subColor = .systemOrange }
-                else if account.tokenExpiry != nil && account.tokenExpiry! < Date() { subColor = .systemRed }
-                else { subColor = .tertiaryLabelColor }
-                title.append(NSAttributedString(string: "\n\(subLine)\(tokenWarning)", attributes: [
-                    .font: NSFont.systemFont(ofSize: 10), .foregroundColor: subColor
-                ]))
-            }
-
-            item.attributedTitle = title
-            item.target = self
-            item.action = isActive ? nil : #selector(switchAccount(_:))
-            menu.addItem(item)
+            removeItem.submenu = sub
+            menu.addItem(removeItem)
         }
 
         menu.addItem(NSMenuItem.separator())
 
-        let loginItem = NSMenuItem(title: "Login New Account...", action: #selector(loginNewAccount), keyEquivalent: "l")
-        loginItem.target = self
-        menu.addItem(loginItem)
+        let launchItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin(_:)), keyEquivalent: "")
+        launchItem.target = self
+        if #available(macOS 13.0, *) {
+            launchItem.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
+        } else { launchItem.isEnabled = false }
+        menu.addItem(launchItem)
 
-        let refreshItem = NSMenuItem(title: "Refresh Usage", action: #selector(refreshUsage), keyEquivalent: "r")
-        refreshItem.target = self
-        menu.addItem(refreshItem)
+        // Settings submenu
+        let settingsItem = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
+        let settingsMenu = NSMenu()
 
-        menu.addItem(NSMenuItem.separator())
+        // Auto refresh
+        let refreshHeader = NSMenuItem(title: "Auto Refresh", action: nil, keyEquivalent: "")
+        refreshHeader.isEnabled = false
+        settingsMenu.addItem(refreshHeader)
+        for (label, mins) in [("5 min", 5), ("15 min", 15), ("30 min", 30), ("1 hour", 60), ("2 hours", 120), ("Off", 0)] {
+            let opt = NSMenuItem(title: "  \(label)", action: #selector(setRefreshInterval(_:)), keyEquivalent: "")
+            opt.target = self; opt.tag = mins
+            opt.state = config.refreshIntervalMinutes == mins ? .on : .off
+            settingsMenu.addItem(opt)
+        }
 
-        let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
-        quitItem.target = self
-        menu.addItem(quitItem)
+        settingsMenu.addItem(NSMenuItem.separator())
 
+        // 5h alert threshold
+        let alert5hHeader = NSMenuItem(title: "5h Alert Below", action: nil, keyEquivalent: "")
+        alert5hHeader.isEnabled = false
+        settingsMenu.addItem(alert5hHeader)
+        for pct in [10, 20, 30, 50] {
+            let opt = NSMenuItem(title: "  \(pct)%", action: #selector(setAlert5hThreshold(_:)), keyEquivalent: "")
+            opt.target = self; opt.tag = pct
+            opt.state = config.alert5hThreshold == pct ? .on : .off
+            settingsMenu.addItem(opt)
+        }
+
+        settingsMenu.addItem(NSMenuItem.separator())
+
+        // Week alert threshold
+        let alertWkHeader = NSMenuItem(title: "Week Alert Below", action: nil, keyEquivalent: "")
+        alertWkHeader.isEnabled = false
+        settingsMenu.addItem(alertWkHeader)
+        for pct in [5, 10, 20, 30] {
+            let opt = NSMenuItem(title: "  \(pct)%", action: #selector(setAlertWeekThreshold(_:)), keyEquivalent: "")
+            opt.target = self; opt.tag = pct
+            opt.state = config.alertWeekThreshold == pct ? .on : .off
+            settingsMenu.addItem(opt)
+        }
+
+        settingsItem.submenu = settingsMenu
+        menu.addItem(settingsItem)
+
+        addMenuItem(menu, "Quit", #selector(quit), "q")
         statusItem.menu = menu
     }
+
+    private func addMenuItem(_ menu: NSMenu, _ title: String, _ action: Selector, _ key: String) {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.target = self
+        menu.addItem(item)
+    }
+
+    private func buildCard(_ menu: NSMenu, _ acct: CodexAccount, isActive: Bool) {
+        let item = NSMenuItem()
+        let s = NSMutableAttributedString()
+        let indent = isActive ? "  " : "  "
+
+        // Row 1: alias + plan
+        if isActive {
+            s.append(NSAttributedString(string: "\u{25CF} ", attributes: [
+                .font: NSFont.systemFont(ofSize: 8), .foregroundColor: NSColor.systemGreen
+            ]))
+        }
+        s.append(NSAttributedString(string: acct.alias, attributes: [
+            .font: NSFont.systemFont(ofSize: 13, weight: isActive ? .semibold : .medium),
+            .foregroundColor: NSColor.labelColor
+        ]))
+
+        // Plan badge
+        let badgeText = " \(acct.planLabel) "
+        s.append(NSAttributedString(string: "  ", attributes: [.font: NSFont.systemFont(ofSize: 9)]))
+
+        let badge = NSMutableAttributedString(string: badgeText, attributes: [
+            .font: NSFont.systemFont(ofSize: 8, weight: .bold),
+            .foregroundColor: acct.planColor,
+            .backgroundColor: acct.planColor.withAlphaComponent(0.12),
+            .baselineOffset: 2
+        ])
+        s.append(badge)
+
+        // Row 2: email
+        s.append(NSAttributedString(string: "\n\(indent) \(acct.email)", attributes: [
+            .font: NSFont.systemFont(ofSize: 10.5),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]))
+
+        // Row 3-4: usage bars
+        let state = rateLimitClient.usageByAlias[acct.alias] ?? .idle
+        switch state {
+        case .success(let rl):
+            let labelFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .medium)
+            let labelColor = NSColor.tertiaryLabelColor
+            let pctFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .semibold)
+
+            if let p = rl.primary {
+                s.append(NSAttributedString(string: "\n\(indent) ", attributes: [.font: NSFont.systemFont(ofSize: 11)]))
+                s.append(NSAttributedString(string: "5h   ", attributes: [.font: labelFont, .foregroundColor: labelColor]))
+                s.append(barAttachment(remaining: p.remaining))
+                s.append(NSAttributedString(string: " ", attributes: [.font: NSFont.systemFont(ofSize: 4)]))
+                let pctStr = String(format: "%3d%%", p.remaining)
+                s.append(NSAttributedString(string: pctStr, attributes: [.font: pctFont, .foregroundColor: p.textColor]))
+                if let r = p.resetsAt, p.remaining < 100 {
+                    s.append(NSAttributedString(string: "  \(formatResetTime(r))", attributes: [
+                        .font: NSFont.systemFont(ofSize: 9), .foregroundColor: labelColor]))
+                }
+            }
+            if let sec = rl.secondary {
+                s.append(NSAttributedString(string: "\n\(indent) ", attributes: [.font: NSFont.systemFont(ofSize: 11)]))
+                s.append(NSAttributedString(string: "Week ", attributes: [.font: labelFont, .foregroundColor: labelColor]))
+                s.append(barAttachment(remaining: sec.remaining))
+                s.append(NSAttributedString(string: " ", attributes: [.font: NSFont.systemFont(ofSize: 4)]))
+                let pctStr = String(format: "%3d%%", sec.remaining)
+                s.append(NSAttributedString(string: pctStr, attributes: [.font: pctFont, .foregroundColor: sec.textColor]))
+                if let r = sec.resetsAt, sec.remaining < 100 {
+                    s.append(NSAttributedString(string: "  \(formatResetTime(r))", attributes: [
+                        .font: NSFont.systemFont(ofSize: 9), .foregroundColor: labelColor]))
+                }
+            }
+
+        case .loading:
+            s.append(NSAttributedString(string: "\n\(indent) Loading...", attributes: [
+                .font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.tertiaryLabelColor
+            ]))
+
+        case .failed(let reason):
+            s.append(NSAttributedString(string: "\n\(indent) \(reason)", attributes: [
+                .font: NSFont.systemFont(ofSize: 10),
+                .foregroundColor: NSColor(red: 0.9, green: 0.5, blue: 0.2, alpha: 1.0)
+            ]))
+
+        case .idle: break
+        }
+
+        item.attributedTitle = s
+        if isActive {
+            item.isEnabled = false
+        } else {
+            item.target = self; item.action = #selector(switchAccount(_:))
+            item.representedObject = acct.alias
+        }
+        menu.addItem(item)
+    }
+
+    // MARK: - Actions
 
     @objc private func switchAccount(_ sender: NSMenuItem) {
         guard let alias = sender.representedObject as? String else { return }
         if authManager.switchTo(alias: alias) {
             updateMenu()
-            // Re-fetch rate limits for new account
-            rateLimitClient.refresh()
-            let n = NSUserNotification()
-            n.title = "Codex Account Switched"
-            n.informativeText = "Now using: \(alias)"
-            NSUserNotificationCenter.default.deliver(n)
+            // Refresh in background after a delay, don't block UI
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self = self else { return }
+                self.rateLimitClient.fetchAll(self.authManager.listAccounts())
+            }
+            sendNotification(title: "Codex Account Switched", body: "Now using: \(alias)")
         } else {
-            let a = NSAlert()
-            a.messageText = "Switch Failed"
-            a.informativeText = "Could not switch to '\(alias)'"
-            a.alertStyle = .warning
-            a.runModal()
+            let a = NSAlert(); a.messageText = "Switch Failed"
+            a.informativeText = "Could not switch to '\(alias)'"; a.alertStyle = .warning; a.runModal()
         }
     }
 
-    @objc private func loginNewAccount() {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        task.arguments = ["-a", "Terminal", "/Applications/Codex.app/Contents/Resources/codex", "--args", "login"]
-        try? task.run()
+    @objc private func deleteAccount(_ sender: NSMenuItem) {
+        guard let alias = sender.representedObject as? String else { return }
+        if alias == authManager.currentAlias() {
+            let a = NSAlert(); a.messageText = "Cannot Remove Active Account"
+            a.informativeText = "Switch to another account first."; a.alertStyle = .warning; a.runModal()
+            return
+        }
+        let c = NSAlert(); c.messageText = "Remove '\(alias)'?"
+        c.informativeText = "You can re-add it later with Login."
+        c.alertStyle = .warning; c.addButton(withTitle: "Remove"); c.addButton(withTitle: "Cancel")
+        if c.runModal() == .alertFirstButtonReturn {
+            if authManager.deleteAccount(alias: alias) {
+                rateLimitClient.usageByAlias.removeValue(forKey: alias); updateMenu()
+            }
+        }
     }
 
     @objc private func refreshUsage() {
-        rateLimitClient.rateLimitInfo = nil
-        updateMenu()
-        rateLimitClient.refresh()
+        rateLimitClient.fetchAll(authManager.listAccounts())
     }
 
-    @objc private func quit() {
-        NSApplication.shared.terminate(nil)
+    @objc private func setRefreshInterval(_ sender: NSMenuItem) {
+        config.refreshIntervalMinutes = sender.tag
+        config.save(); scheduleTimer(); updateMenu()
     }
+
+    @objc private func setAlert5hThreshold(_ sender: NSMenuItem) {
+        config.alert5hThreshold = sender.tag
+        config.save(); previousAlertState = (false, false); updateMenu()
+    }
+
+    @objc private func setAlertWeekThreshold(_ sender: NSMenuItem) {
+        config.alertWeekThreshold = sender.tag
+        config.save(); previousAlertState = (false, false); updateMenu()
+    }
+
+    @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
+        if #available(macOS 13.0, *) {
+            do {
+                if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister() }
+                else { try SMAppService.mainApp.register() }
+                updateMenu()
+            } catch {}
+        }
+    }
+
+    @objc private func quit() { NSApplication.shared.terminate(nil) }
 
     private func watchAuthFile() {
         let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
         let fd = open(dir.path, O_EVTONLY)
         guard fd >= 0 else { return }
         let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: .write, queue: .main)
-        source.setEventHandler { [weak self] in self?.updateMenu() }
+        source.setEventHandler { [weak self] in
+            self?.authManager.syncAuthToAccounts(); self?.updateMenu()
+        }
         source.setCancelHandler { close(fd) }
         source.resume()
         fileMonitor = source
