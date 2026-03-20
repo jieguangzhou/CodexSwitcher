@@ -873,24 +873,57 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func quit() { NSApplication.shared.terminate(nil) }
 
     private var lastFileEventTime: Date = .distantPast
+    private var authFileMonitor: DispatchSourceFileSystemObject?
+
+    private func onAuthChanged() {
+        let now = Date()
+        guard now.timeIntervalSince(lastFileEventTime) > 2 else { return }
+        lastFileEventTime = now
+        authManager.syncAuthToAccounts()
+        updateMenu()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self = self else { return }
+            self.rateLimitClient.fetchAll(self.authManager.listAccounts())
+        }
+    }
 
     private func watchAuthFile() {
-        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
-        let fd = open(dir.path, O_EVTONLY)
-        guard fd >= 0 else { return }
-        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: .write, queue: .main)
-        source.setEventHandler { [weak self] in
-            guard let self = self else { return }
-            // Debounce: ignore events within 2 seconds of each other
-            let now = Date()
-            guard now.timeIntervalSince(self.lastFileEventTime) > 2 else { return }
-            self.lastFileEventTime = now
-            self.authManager.syncAuthToAccounts()
-            self.updateMenu()
+        let codexDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
+
+        // Watch directory (catches new files, renames)
+        let dirFd = open(codexDir.path, O_EVTONLY)
+        if dirFd >= 0 {
+            let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: dirFd, eventMask: [.write, .rename], queue: .main)
+            source.setEventHandler { [weak self] in
+                self?.onAuthChanged()
+                // Re-watch auth.json in case it was recreated
+                self?.watchAuthJsonFile()
+            }
+            source.setCancelHandler { close(dirFd) }
+            source.resume()
+            fileMonitor = source
         }
-        source.setCancelHandler { close(fd) }
+
+        watchAuthJsonFile()
+    }
+
+    private func watchAuthJsonFile() {
+        // Cancel previous watcher
+        authFileMonitor?.cancel()
+        authFileMonitor = nil
+
+        let authPath = authManager.authFile
+        let authFd = open(authPath, O_EVTONLY)
+        guard authFd >= 0 else { return }
+        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: authFd, eventMask: [.write, .rename, .delete, .attrib], queue: .main)
+        source.setEventHandler { [weak self] in
+            self?.onAuthChanged()
+            // File may have been replaced, re-watch
+            self?.watchAuthJsonFile()
+        }
+        source.setCancelHandler { close(authFd) }
         source.resume()
-        fileMonitor = source
+        authFileMonitor = source
     }
 }
 
