@@ -27,6 +27,7 @@ open CodexSwitcher.app
 - **Rate limits for all accounts** — 5h and weekly usage with progress bars
 - **Low quota alerts** — status bar icon changes when running low, with system notifications
 - **Auto-sync** — detects new accounts after `codex login`
+- **Codex desktop hot reload** — after a switch, restarts the Codex desktop backend so the new account applies without reopening the app; waits until any running task finishes
 - **Zero config** — works out of the box, settings adjustable from the menu
 
 ## License
