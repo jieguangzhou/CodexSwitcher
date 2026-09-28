@@ -4,3 +4,6 @@ CodexSwitcher.app/
 CodexSwitcher.zip
 .DS_Store
 release.sh
+
+# Reference bundles extracted from the Codex desktop app
+*.js
