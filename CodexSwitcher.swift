@@ -251,6 +251,68 @@ class CodexAuthManager {
     }
 }
 
+struct CodexDesktopActivitySnapshot {
+    let capturedAt: Date
+    let inflightTurns: Int
+    let pendingRequests: Int
+    let snapshotReason: String?
+
+    var isBusy: Bool {
+        inflightTurns > 0 || pendingRequests > 0
+    }
+
+    func isFresh(maxAge: TimeInterval) -> Bool {
+        Date().timeIntervalSince(capturedAt) <= maxAge
+    }
+
+    var busySummary: String {
+        if inflightTurns > 0 && pendingRequests > 0 {
+            return "\(inflightTurns) active turn(s), \(pendingRequests) pending request(s)"
+        }
+        if inflightTurns > 0 {
+            return "\(inflightTurns) active turn(s)"
+        }
+        if pendingRequests > 0 {
+            return "\(pendingRequests) pending request(s)"
+        }
+        return "idle"
+    }
+}
+
+class CodexDesktopActivityMonitor {
+    private let scopeFile: String = {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return "\(home)/Library/Application Support/Codex/sentry/scope_v3.json"
+    }()
+
+    func latestSnapshot() -> CodexDesktopActivitySnapshot? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: scopeFile)),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let scope = json["scope"] as? [String: Any],
+              let breadcrumbs = scope["breadcrumbs"] as? [[String: Any]] else {
+            return nil
+        }
+
+        for breadcrumb in breadcrumbs.reversed() {
+            guard breadcrumb["category"] as? String == "app_state",
+                  breadcrumb["message"] as? String == "app_state_snapshot",
+                  let timestamp = breadcrumb["timestamp"] as? Double,
+                  let snapshot = breadcrumb["data"] as? [String: Any] else {
+                continue
+            }
+
+            return CodexDesktopActivitySnapshot(
+                capturedAt: Date(timeIntervalSince1970: timestamp),
+                inflightTurns: snapshot["inflight_turn_count"] as? Int ?? 0,
+                pendingRequests: snapshot["pending_request_count"] as? Int ?? 0,
+                snapshotReason: snapshot["snapshot_reason"] as? String
+            )
+        }
+
+        return nil
+    }
+}
+
 // MARK: - Rate Limit Client
 
 class RateLimitClient {
