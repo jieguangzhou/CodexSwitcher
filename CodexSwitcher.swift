@@ -513,13 +513,26 @@ class RateLimitClient {
 // MARK: - Menu Bar App
 
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private struct PendingDesktopReload {
+        let id: UUID
+        let alias: String
+        let requestedAt: Date
+    }
+
     private var statusItem: NSStatusItem!
     private let authManager = CodexAuthManager.shared
+    private let desktopActivityMonitor = CodexDesktopActivityMonitor()
+    private let desktopReloader = CodexDesktopReloader()
     private var fileMonitor: DispatchSourceFileSystemObject?
     private let rateLimitClient = RateLimitClient()
     private var refreshTimer: Timer?
     private var config = AppConfig.load()
     private var previousAlertState: (p5h: Bool, pWk: Bool) = (false, false)
+    private var pendingDesktopReload: PendingDesktopReload?
+    private var pendingReloadTimer: Timer?
+    private var isCheckingPendingReload = false
+    private let desktopSnapshotFreshness: TimeInterval = 20
+    private let pendingReloadPollInterval: TimeInterval = 5
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -1000,10 +1013,172 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let self = self else { return }
                 self.rateLimitClient.fetchAll(self.authManager.listAccounts())
             }
-            sendNotification(title: "Codex Account Switched", body: "Now using: \(alias)")
+            handleDesktopReloadAfterSwitch(to: alias)
         } else {
             let a = NSAlert(); a.messageText = "Switch Failed"
             a.informativeText = "Could not switch to '\(alias)'"; a.alertStyle = .warning; a.runModal()
+        }
+    }
+
+    private func handleDesktopReloadAfterSwitch(to alias: String) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+
+            guard self.desktopReloader.isDesktopAppRunning() else {
+                DispatchQueue.main.async {
+                    self.sendNotification(title: "Codex Account Switched", body: "Now using: \(alias)")
+                }
+                return
+            }
+
+            let snapshot = self.desktopActivityMonitor.latestSnapshot()
+            let isFresh = snapshot?.isFresh(maxAge: self.desktopSnapshotFreshness) ?? false
+            let isBusy = snapshot?.isBusy ?? false
+
+            DispatchQueue.main.async {
+                if isFresh && !isBusy {
+                    self.performDesktopReloadNow(alias: alias, notificationTitle: "Codex Account Switched")
+                } else {
+                    self.queueDesktopReload(alias: alias, snapshot: snapshot)
+                }
+            }
+        }
+    }
+
+    private func queueDesktopReload(alias: String, snapshot: CodexDesktopActivitySnapshot?) {
+        pendingDesktopReload = PendingDesktopReload(id: UUID(), alias: alias, requestedAt: Date())
+        ensurePendingReloadTimer()
+        sendNotification(
+            title: "Codex Account Switched",
+            body: queuedReloadNotificationBody(alias: alias, snapshot: snapshot)
+        )
+    }
+
+    private func ensurePendingReloadTimer() {
+        guard pendingReloadTimer == nil else { return }
+        pendingReloadTimer = Timer.scheduledTimer(withTimeInterval: pendingReloadPollInterval, repeats: true) { [weak self] _ in
+            self?.checkPendingDesktopReload()
+        }
+    }
+
+    private func clearPendingDesktopReload() {
+        pendingDesktopReload = nil
+        pendingReloadTimer?.invalidate()
+        pendingReloadTimer = nil
+        isCheckingPendingReload = false
+    }
+
+    private func checkPendingDesktopReload() {
+        guard let pending = pendingDesktopReload, !isCheckingPendingReload else { return }
+        isCheckingPendingReload = true
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
+            let snapshot = self.desktopActivityMonitor.latestSnapshot()
+            let isFresh = snapshot?.isFresh(maxAge: self.desktopSnapshotFreshness) ?? false
+
+            if !self.desktopReloader.isDesktopAppRunning() {
+                DispatchQueue.main.async {
+                    self.isCheckingPendingReload = false
+                    guard self.pendingDesktopReload?.id == pending.id else { return }
+                    self.clearPendingDesktopReload()
+                    self.sendNotification(
+                        title: "Codex Account Ready",
+                        body: "Now using: \(pending.alias). Codex was closed before backend reload; the new account will apply on next launch."
+                    )
+                }
+                return
+            }
+
+            guard isFresh, let freshSnapshot = snapshot else {
+                DispatchQueue.main.async {
+                    self.isCheckingPendingReload = false
+                }
+                return
+            }
+
+            guard !freshSnapshot.isBusy else {
+                DispatchQueue.main.async {
+                    self.isCheckingPendingReload = false
+                }
+                return
+            }
+
+            let reloadResult = self.desktopReloader.reloadAppServer()
+            if case .failed(let reason) = reloadResult {
+                NSLog("Codex deferred desktop reload failed: %@", reason)
+            }
+
+            DispatchQueue.main.async {
+                self.isCheckingPendingReload = false
+                guard self.pendingDesktopReload?.id == pending.id else { return }
+                switch reloadResult {
+                case .restarted, .appNotRunning, .failed:
+                    self.clearPendingDesktopReload()
+                    self.sendNotification(
+                        title: "Codex Account Ready",
+                        body: self.completedQueuedReloadNotificationBody(alias: pending.alias, reloadResult: reloadResult)
+                    )
+                case .backendNotFound:
+                    self.isCheckingPendingReload = false
+                }
+            }
+        }
+    }
+
+    private func performDesktopReloadNow(alias: String, notificationTitle: String) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let reloadResult = self.desktopReloader.reloadAppServer()
+            if case .failed(let reason) = reloadResult {
+                NSLog("Codex desktop reload failed: %@", reason)
+            }
+            DispatchQueue.main.async {
+                if case .backendNotFound = reloadResult {
+                    self.queueDesktopReload(alias: alias, snapshot: nil)
+                    return
+                }
+                self.sendNotification(
+                    title: notificationTitle,
+                    body: self.switchNotificationBody(alias: alias, reloadResult: reloadResult)
+                )
+            }
+        }
+    }
+
+    private func queuedReloadNotificationBody(alias: String, snapshot: CodexDesktopActivitySnapshot?) -> String {
+        guard let snapshot else {
+            return "Now using: \(alias). Waiting for Codex to become idle before reloading the backend."
+        }
+        if snapshot.isFresh(maxAge: desktopSnapshotFreshness) && snapshot.isBusy {
+            return "Now using: \(alias). Codex has \(snapshot.busySummary); backend reload is queued until the current run finishes."
+        }
+        return "Now using: \(alias). Waiting for a fresh idle state before reloading the backend."
+    }
+
+    private func switchNotificationBody(alias: String, reloadResult: CodexDesktopReloadResult) -> String {
+        switch reloadResult {
+        case .restarted:
+            return "Now using: \(alias). Codex backend reloaded."
+        case .appNotRunning:
+            return "Now using: \(alias)"
+        case .backendNotFound:
+            return "Now using: \(alias). Reopen Codex once if the current window does not refresh."
+        case .failed:
+            return "Now using: \(alias). If the current Codex window does not refresh, reopen Codex once."
+        }
+    }
+
+    private func completedQueuedReloadNotificationBody(alias: String, reloadResult: CodexDesktopReloadResult) -> String {
+        switch reloadResult {
+        case .restarted:
+            return "Now using: \(alias). Codex became idle and the backend was reloaded."
+        case .appNotRunning:
+            return "Now using: \(alias). Codex closed before the deferred reload completed."
+        case .backendNotFound:
+            return "Now using: \(alias)."
+        case .failed:
+            return "Now using: \(alias). Deferred backend reload failed; reopen Codex once if the current window does not refresh."
         }
     }
 
