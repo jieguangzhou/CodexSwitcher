@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import UserNotifications
 import ServiceManagement
@@ -251,6 +252,13 @@ class CodexAuthManager {
     }
 }
 
+enum CodexDesktopReloadResult {
+    case restarted(Int)
+    case appNotRunning
+    case backendNotFound
+    case failed(String)
+}
+
 struct CodexDesktopActivitySnapshot {
     let capturedAt: Date
     let inflightTurns: Int
@@ -310,6 +318,119 @@ class CodexDesktopActivityMonitor {
         }
 
         return nil
+    }
+}
+
+class CodexDesktopReloader {
+    private struct ProcessRow {
+        let pid: pid_t
+        let parentPID: pid_t
+        let command: String
+    }
+
+    private let bundleIdentifier = "com.openai.codex"
+    private let appExecutableSuffix = "/Contents/MacOS/Codex"
+    private let appServerMarker = "/Contents/Resources/codex app-server"
+
+    func isDesktopAppRunning() -> Bool {
+        !desktopAppPIDs().isEmpty
+    }
+
+    func reloadAppServer() -> CodexDesktopReloadResult {
+        let appPIDs = desktopAppPIDs()
+        guard !appPIDs.isEmpty else { return .appNotRunning }
+        guard let processes = processTable() else {
+            return .failed("Unable to inspect process table")
+        }
+
+        let appServerPIDs = processes
+            .filter { appPIDs.contains($0.parentPID) && $0.command.contains(appServerMarker) }
+            .map(\.pid)
+
+        guard !appServerPIDs.isEmpty else { return .backendNotFound }
+
+        let termFailures = appServerPIDs.filter { !send(signal: SIGTERM, to: $0) }
+        if !termFailures.isEmpty {
+            return .failed("SIGTERM failed for pid(s): \(termFailures.map(String.init).joined(separator: ", "))")
+        }
+
+        waitForExit(appServerPIDs, timeout: 1.5)
+
+        let survivors = appServerPIDs.filter { processExists($0) }
+        if !survivors.isEmpty {
+            let killFailures = survivors.filter { !send(signal: SIGKILL, to: $0) }
+            if !killFailures.isEmpty {
+                return .failed("SIGKILL failed for pid(s): \(killFailures.map(String.init).joined(separator: ", "))")
+            }
+            waitForExit(survivors, timeout: 0.5)
+        }
+
+        return .restarted(appServerPIDs.count)
+    }
+
+    private func desktopAppPIDs() -> Set<pid_t> {
+        Set(NSWorkspace.shared.runningApplications.compactMap { app in
+            guard app.bundleIdentifier == bundleIdentifier else { return nil }
+            guard let path = app.executableURL?.path, path.hasSuffix(appExecutableSuffix) else { return nil }
+            return app.processIdentifier
+        })
+    }
+
+    private func processTable() -> [ProcessRow]? {
+        guard let output = runProcess("/bin/ps", arguments: ["-Ao", "pid=,ppid=,command="]) else {
+            return nil
+        }
+
+        return output
+            .split(separator: "\n")
+            .compactMap { line in
+                let parts = line.split(maxSplits: 2, omittingEmptySubsequences: true, whereSeparator: \.isWhitespace)
+                guard parts.count == 3,
+                      let pid = Int32(parts[0]),
+                      let parentPID = Int32(parts[1]) else {
+                    return nil
+                }
+                return ProcessRow(pid: pid, parentPID: parentPID, command: String(parts[2]))
+            }
+    }
+
+    private func runProcess(_ launchPath: String, arguments: [String]) -> String? {
+        let process = Process()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: launchPath)
+        process.arguments = arguments
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return nil
+        }
+
+        guard process.terminationStatus == 0 else { return nil }
+        let data = stdout.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8)
+    }
+
+    private func send(signal: Int32, to pid: pid_t) -> Bool {
+        if kill(pid, signal) == 0 { return true }
+        return errno == ESRCH
+    }
+
+    private func processExists(_ pid: pid_t) -> Bool {
+        if kill(pid, 0) == 0 { return true }
+        return errno != ESRCH
+    }
+
+    private func waitForExit(_ pids: [pid_t], timeout: TimeInterval) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if pids.allSatisfy({ !processExists($0) }) { return }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
     }
 }
 
